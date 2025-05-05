@@ -2,6 +2,8 @@ import argparse
 import torch
 from torch.nn import functional as F
 from torchvision import transforms
+from torchvision.transforms import InterpolationMode
+import torchvision.transforms.functional as TF
 from torch.utils.data import DataLoader
 import cv2
 import numpy as np
@@ -19,7 +21,27 @@ import csv
 from load_dataset import load_Dataset
 from utils import *
 
-        
+class ResizeWithPadding:
+    def __init__(self, target_size, interpolation=InterpolationMode.LANCZOS):
+        self.target_size = target_size
+        self.interpolation = interpolation
+
+    def __call__(self, img):
+        # 等比例縮放，短邊變成 target_size，長邊等比縮放
+        w, h = img.size
+        scale = self.target_size / max(w, h)
+        new_w, new_h = int(w * scale), int(h * scale)
+        img = TF.resize(img, (new_h, new_w), interpolation=self.interpolation)
+
+        # 補齊 padding，讓圖片變成 target_size × target_size
+        pad_left = (self.target_size - new_w) // 2
+        pad_top = (self.target_size - new_h) // 2
+        pad_right = self.target_size - new_w - pad_left
+        pad_bottom = self.target_size - new_h - pad_top
+
+        img = TF.pad(img, (pad_left, pad_top, pad_right, pad_bottom), fill=0)
+        return img
+       
 class MODEL(pl.LightningModule):
     def __init__(self, hparams):
         super(MODEL, self).__init__()
@@ -29,12 +51,14 @@ class MODEL(pl.LightningModule):
         self.init_features()
         def hook_t(module, input, output):
             self.features.append(output)
+        
 
         self.model = torch.hub.load('pytorch/vision:v0.9.0', 'wide_resnet50_2', pretrained=True)
 
         for param in self.model.parameters():
             param.requires_grad = False
 
+        #提取特徵
         self.model.layer2[-1].register_forward_hook(hook_t)
         self.model.layer3[-1].register_forward_hook(hook_t)
         #print(self.model)
@@ -46,16 +70,18 @@ class MODEL(pl.LightningModule):
         mean_train = [0.485, 0.456, 0.406]
         std_train = [0.229, 0.224, 0.225]
 
+        target_input_size = args.input_size  # 例如 512
+
         self.data_transforms = transforms.Compose([
-                        transforms.Resize((args.load_size, args.load_size), Image.ANTIALIAS),
-                        transforms.ToTensor(),
-                        transforms.CenterCrop(args.input_size),
-                        transforms.Normalize(mean=mean_train,
-                                            std=std_train)])
+            ResizeWithPadding(target_size=target_input_size),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=mean_train, std=std_train)
+        ])
+
         self.gt_transforms = transforms.Compose([
-                        transforms.Resize((args.load_size, args.load_size)),
-                        transforms.ToTensor(),
-                        transforms.CenterCrop(args.input_size)])
+            ResizeWithPadding(target_size=target_input_size),
+            transforms.ToTensor()
+        ])
 
         self.inv_normalize = transforms.Normalize(mean=[-0.485/0.229, -0.456/0.224, -0.406/0.255], std=[1/0.229, 1/0.224, 1/0.255])
 
@@ -73,6 +99,8 @@ class MODEL(pl.LightningModule):
         self.features = []
 
     def forward(self, x_t):
+        device = next(self.model.parameters()).device  # 最穩的做法
+        x_t = x_t.to(device)
         self.init_features()
         _ = self.model(x_t)
         return self.features
@@ -97,12 +125,12 @@ class MODEL(pl.LightningModule):
 
     def train_dataloader(self):
         image_datasets = load_Dataset(root=args.dataset_path, transform=self.data_transforms, phase='train')
-        train_loader = DataLoader(image_datasets, batch_size=args.batch_size, shuffle=True, num_workers=1) #, pin_memory=True)
+        train_loader = DataLoader(image_datasets, batch_size=args.batch_size, shuffle=True,pin_memory=True, num_workers=4) #, pin_memory=True)
         return train_loader
 
     def test_dataloader(self):
         test_datasets = load_Dataset(root=args.dataset_path, transform=self.data_transforms, phase='test')
-        test_loader = DataLoader(test_datasets, batch_size=1, shuffle=False, num_workers=1) #, pin_memory=True) # only work on batch_size=1, now.
+        test_loader = DataLoader(test_datasets, batch_size=1, shuffle=False,pin_memory=True, num_workers=4) #, pin_memory=True) # only work on batch_size=1, now.
         return test_loader
 
     def configure_optimizers(self):
@@ -126,10 +154,9 @@ class MODEL(pl.LightningModule):
             avep = torch.nn.AvgPool2d(3, 1, 1)
             maxp = torch.nn.MaxPool2d(3, 1, 1)
             
-            if feature.shape[3] == 28:
+            if feature.shape[3] > 14:
                 saconv_out = avep(feature) 
-
-            elif feature.shape[3] ==14:
+            else:
                 attention_in1 = maxp(feature[:])
                 attention_in2 = maxp(feature[:])
                 attention_v = maxp(feature[:]) 
@@ -137,7 +164,7 @@ class MODEL(pl.LightningModule):
                 width = attention_in1.shape[3]
         
                 attention_in1_flatten = torch.flatten(attention_in1[:], 2, 3)
-                attention_in2_flatten = torch.flatten(attention_in1[:], 2, 3)
+                attention_in2_flatten = torch.flatten(attention_in2[:], 2, 3)
                 attention_v = torch.flatten(attention_v[:], 2, 3)
                 attention_in1 = torch.reshape(attention_in1_flatten, (attention_in1_flatten.shape[0], attention_in1_flatten.shape[1], attention_in1_flatten.shape[2], 1))
                 attention_in2 = torch.reshape(attention_in2_flatten, (attention_in2_flatten.shape[0], attention_in2_flatten.shape[1], 1, attention_in2_flatten.shape[2]))
@@ -168,6 +195,7 @@ class MODEL(pl.LightningModule):
         with open(os.path.join(self.embedding_dir_path, 'embedding.pickle'), 'wb') as f:
             pickle.dump(self.embedding_coreset, f)
 
+
     def test_step(self, batch, batch_idx): # Nearest Neighbour Search
         
         self.embedding_coreset = pickle.load(open(os.path.join(self.embedding_dir_path, 'embedding.pickle'), 'rb'))
@@ -179,10 +207,10 @@ class MODEL(pl.LightningModule):
             avep = torch.nn.AvgPool2d(3, 1, 1)
             maxp = torch.nn.MaxPool2d(3, 1, 1)
 
-            if feature.shape[3] == 28:
+            if feature.shape[3] > 14:
                 saconv_out = avep(feature) 
 
-            elif feature.shape[3] == 14:
+            else: 
                 attention_in1 = maxp(feature[:])
                 attention_in2 = maxp(feature[:])
                 attention_v = maxp(feature[:]) 
@@ -190,7 +218,7 @@ class MODEL(pl.LightningModule):
                 width = attention_in1.shape[3]
                 
                 attention_in1_flatten = torch.flatten(attention_in1[:], 2, 3)
-                attention_in2_flatten = torch.flatten(attention_in1[:], 2, 3)
+                attention_in2_flatten = torch.flatten(attention_in2[:], 2, 3)
                 attention_v = torch.flatten(attention_v[:], 2, 3)
                 attention_in1 = torch.reshape(attention_in1_flatten, (attention_in1_flatten.shape[0], attention_in1_flatten.shape[1], attention_in1_flatten.shape[2], 1))
                 attention_in2 = torch.reshape(attention_in2_flatten, (attention_in2_flatten.shape[0], attention_in2_flatten.shape[1], 1, attention_in2_flatten.shape[2]))
@@ -207,7 +235,8 @@ class MODEL(pl.LightningModule):
         knn = KNN(torch.from_numpy(self.embedding_coreset).cuda(), k=9)
         score_patches = knn(torch.from_numpy(embedding_test).cuda())[0].cpu().detach().numpy()
 
-        anomaly_map = score_patches[:,0].reshape((28,28))  
+        h = w = int(np.sqrt(score_patches.shape[0]))
+        anomaly_map = score_patches[:, 0].reshape((h, w)) 
 
         score = max(score_patches[:,0]) # Image-level score
                 
@@ -231,7 +260,7 @@ class MODEL(pl.LightningModule):
         self.input_x_list.append(x)        
 
     def test_epoch_end(self, outputs):
-        name_defect_types = ['0_good', '1_scratch', '2_paint', '3_over-coupling', '4_lacking']  #anomaly category names(directory names) in test directory
+        name_defect_types = ['0_good', '1_scratch']  #anomaly category names(directory names) in test directory
         num_defect_types = []
         for defect_type in name_defect_types:
             num_defect_types.append(self.defect_types.count(defect_type))
@@ -260,7 +289,7 @@ class MODEL(pl.LightningModule):
         
             front += length
 
-        ## SAVE ANOMALY MAPS
+        ## 熱力圖調整
         if args.save_anomaly_map:
             temp_map = np.array(self.anomaly_map_all)
             max_num = temp_map.max()
@@ -282,11 +311,10 @@ class MODEL(pl.LightningModule):
 def get_args():
     parser = argparse.ArgumentParser(description='ANOMALYDETECTION')
     parser.add_argument('--phase', choices=['train','test'], default='train')
-    parser.add_argument('--dataset_path', default=r'./dataset/Co-occurrence Anomaly Detection Screw Dataset') 
+    parser.add_argument('--dataset_path', default=r'C:\Users\user\Desktop\0424\patchcore_13_V2') 
     parser.add_argument('--batch_size', default=1)
-    parser.add_argument('--load_size', default=256) 
-    parser.add_argument('--input_size', default=224)
-    parser.add_argument('--coreset_sampling_ratio', default=0.01)
+    parser.add_argument('--input_size', default=512)
+    parser.add_argument('--coreset_sampling_ratio', default=0.05)
     parser.add_argument('--output_path', default=r'./outputs') 
     parser.add_argument('--save_anomaly_map', default=True)
     parser.add_argument('--n_neighbors', type=int, default=9)
@@ -298,15 +326,20 @@ if __name__ == '__main__':
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     args = get_args()
     
-    trainer = pl.Trainer.from_argparse_args(args, default_root_dir=args.output_path, max_epochs=1, gpus = (device=="cuda") )
+    trainer = pl.Trainer(
+        default_root_dir=args.output_path,
+        max_epochs=1,
+        accelerator="gpu" if torch.cuda.is_available() else "cpu",
+        devices=1
+    )
     model = MODEL(hparams=args)
     if args.phase == 'train':
         trainer.fit(model)
         trainer.test(model)
+
+
     elif args.phase == 'test':
         trainer.test(model)
-
-
 
         
         
