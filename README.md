@@ -37,9 +37,9 @@ def get_args():
     args = parser.parse_args()
     return args
 ~~~
-## train
+## train(run.py)
 After setting the hyperparameters, you can train the model by running:
-## test
+## test(patchcore_test_alldata.py)
 Select Folder (line 163)
 ~~~
 if __name__ == '__main__':
